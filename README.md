@@ -10,4 +10,8 @@ The program will also read the .csv file taking only the frequencies that are cl
 
 --Updates to the README will take place as the project goes on--
 
+30 - 06 - 2025
+
+Created EQ_playback_code.py it gives real time playback with the generated equaliser, right now I cannot pause or choose another song, features I will work on. I also need to link the file with Song_analyser.py so that i can use my generated EQ curve.
+
 
