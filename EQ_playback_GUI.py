@@ -41,7 +41,7 @@ def callback (outdata, frames, time, status):
     if position + frames >= len (audio_data):
         outdata[:] = np.zeros((frames,1))
         raise sd.CallbackStop()
-    chunk = audio[position:position+frames]
+    chunk = audio_data[position:position+frames]
     filters = create_filters()
     eq_chunk = apply_eq(chunk,filters)
     outdata[:, 0] = eq_chunk
@@ -50,11 +50,11 @@ def callback (outdata, frames, time, status):
 def play_audio():
     global position
     position = 0
-    with d.OutputStream(callback = callback, samplerate = sample_rate, channels = 1, blocksize = block_size):
+    with sd.OutputStream(callback = callback, samplerate = sample_rate, channels = 1, blocksize = block_size):
          sd.sleep(int(len(audio_data)/sample_rate *1000))
 def load_audio():
     global audio_data
-    file_path = filedialog.askopenfilename(filetypes = [("WAV files", "*.wav")])
+    file_path = filedialog.askopenfilename(filetypes = [("MP3 files", "*.mp3")])
     y, _= librosa.load(file_path, sr= sample_rate, mono = True)
     audio_data = y
 #Build EQ GUI
@@ -69,7 +69,7 @@ for i, freq in enumerate(EQ_BANDS):
     slider = tk.Scale(col, variable = eq_gains_db[i], from_=12, to =-12, resolution = 0.5, label = f"{int(freq)}Hz", length = 200)
     slider.pack()
 
-btn_load = tk.Button(root, text ="Load Wav", command = load_audio)
+btn_load = tk.Button(root, text ="Load MP3", command = load_audio)
 btn_load.pack(pady =5)
 
 btn_play = tk.Button(root, text= "Play", command = play_audio)
