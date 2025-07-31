@@ -38,7 +38,7 @@ filters = create_band_filters(eq_gains_db, sr)
 block_size = 1024
 position = 0
 
-def callback (outdata, frames, time, status):
+def callback (outdata, frames, time, status): 
     global position
     chunk = audio[position:position+frames]
     if len(chunk) < frames:

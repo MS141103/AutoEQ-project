@@ -1,162 +1,219 @@
+'''MIT License
+
+Copyright (c) 2021 Ramadan Ibrahem
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.'''
+import Song_analyser
+import wave
 import sys
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 import librosa
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt5.QtWidgets import (QApplication, QWidget, QSlider, QVBoxLayout,
-                             QHBoxLayout, QPushButton, QLabel, QFileDialog)
-from PyQt5.QtCore import Qt
-from song_analyser import generate_eq_curve  # Ensure this function returns a 10-band EQ curve
+                             QHBoxLayout, QPushButton, QLabel, QFileDialog, QMainWindow)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+import threading
+from Song_analyser import generate_eq_curve, compute_band_energy, load_band_eq_from_csv  # Ensure this function returns a 10-band EQ curve
 
 EQ_BANDS = [31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
+print(sd.query_devices())
+# Apply EQ with simple gain adjustments (placeholder logic)
+def apply_eq(audio_data, eq_gains_db):
+    gains_linear = 10 ** (np.array(eq_gains_db) / 20)
+    return audio_data * np.mean(gains_linear)
 
-class Equalizer(QWidget):
+class AudioPlaybackThread(QThread):
+    finished = pyqtSignal()
+
+    def __init__(self, audio_data, samplerate):
+        super().__init__()
+        self.audio_data = audio_data
+        self.samplerate = samplerate
+        self._running = True
+        self.paused = False
+
+    def run(self):
+        try:
+            with sd.OutputStream( samplerate=self.samplerate, channels=1) as stream:
+                i = 0
+                block_size = 1024
+                while self._running and i < len(self.audio_data):
+                    if not self.paused:
+                        block = self.audio_data[i:i+block_size]
+                        if len(block) < block_size:
+                            block = np.pad(block, (0, block_size - len(block)))
+                        stream.write(block.astype(np.float32))
+                        i += block_size
+                    else:
+                        self.msleep(100)
+        except Exception as e:
+            print("Audio playback error:", e)
+        self.finished.emit()
+
+    def stop(self):
+        self._running = False
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+
+class EqualizerApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Auto-EQ Sound Equalizer with Visualization")
-        self.eq_gains_db = [0.0] * 10
-        self.auto_eq_curve = None
-        self.audio_data = None
-        self.position = 0
-        self.playing = False
-        self.init_ui()
+        self.setWindowTitle("10-Band EQ Player")
+        self.layout = QVBoxLayout()
 
-    def init_ui(self):
-        layout = QVBoxLayout()
-        sliders_layout = QHBoxLayout()
-        self.sliders = []
-
-        for freq in EQ_BANDS:
-            slider_layout = QVBoxLayout()
-            label = QLabel(f"{int(freq)} Hz")
+        # EQ Sliders
+        self.eq_sliders = []
+        slider_layout = QHBoxLayout()
+        for i in range(10):
             slider = QSlider(Qt.Vertical)
-            slider.setMinimum(-120)
-            slider.setMaximum(120)
+            slider.setMinimum(-10)
+            slider.setMaximum(10)
             slider.setValue(0)
-            slider.setTickInterval(10)
-            slider.setTickPosition(QSlider.TicksRight)
-            slider.valueChanged.connect(self.update_gains)
-            self.sliders.append(slider)
-            slider_layout.addWidget(label)
             slider_layout.addWidget(slider)
-            sliders_layout.addLayout(slider_layout)
+            self.eq_sliders.append(slider)
+        self.layout.addLayout(slider_layout)
 
-        self.load_button = QPushButton("Load WAV")
-        self.load_button.clicked.connect(self.load_audio)
+        # Buttons
+        self.load_btn = QPushButton("Load WAV File")
+        self.play_btn = QPushButton("Play")
+        self.pause_btn = QPushButton("Pause")
+        self.stop_btn = QPushButton("Stop")
 
-        self.play_button = QPushButton("Play")
-        self.play_button.clicked.connect(self.play_audio)
+        self.layout.addWidget(self.load_btn)
+        self.layout.addWidget(self.play_btn)
+        self.layout.addWidget(self.pause_btn)
+        self.layout.addWidget(self.stop_btn)
 
-        self.pause_button = QPushButton("Pause")
-        self.pause_button.clicked.connect(self.pause_audio)
+        self.setLayout(self.layout)
 
-        self.auto_eq_button = QPushButton("Auto EQ")
-        self.auto_eq_button.clicked.connect(self.apply_auto_eq)
+        # Connect buttons
+        self.load_btn.clicked.connect(self.load_audio_file)
+        self.play_btn.clicked.connect(self.start_playback)
+        self.pause_btn.clicked.connect(self.pause_playback)
+        self.stop_btn.clicked.connect(self.stop_playback)
 
-        # Matplotlib figures for EQ curve and spectrogram
-        self.figure, (self.ax_eq, self.ax_spec) = plt.subplots(2, 1, figsize=(6, 6))
-        self.canvas = FigureCanvas(self.figure)
+        self.audio_data = None
+        self.samplerate = 44100
+        self.audio_thread = None
+        
+        #graph setup
+        self.plot_canvas = FigureCanvas(Figure(figsize = (6, 3)))
+        self.layout.addWidget(self.plot_canvas)
+        
+    def plot_eq_curve(self, eq_curve):
+        bands = [f"Band {i+1}" for i in range(len(eq_curve))]
+        plt.figure("Generated EQ Curve")
+        plt.bar(bands, eq_curve)
+        plt.xlabel("Frequency Bands")
+        plt.ylabel("Gain (dB)")
+        plt.title("Auto-Generated EQ Curve")
+        plt.tight_layout()
+        plt.show()
 
-        layout.addLayout(sliders_layout)
-        layout.addWidget(self.load_button)
-        layout.addWidget(self.play_button)
-        layout.addWidget(self.pause_button)
-        layout.addWidget(self.auto_eq_button)
-        layout.addWidget(self.canvas)
-        self.setLayout(layout)
+    def plot_frequency_decomposition(self, song_profile):
+        bands = [f"Band {i+1}" for i in range(len(song_profile))]
+        plt.figure("Song Frequency Decomposition")
+        plt.bar(bands, song_profile)
+        plt.xlabel("Frequency Bands")
+        plt.ylabel("Relative Energy")
+        plt.title("Frequency Distribution of Loaded Song")
+        plt.tight_layout()
+        plt.show()
+    def show_eq_plot(self, eq_curve, song_profile):
+        self.plot_canvas.figure.clf()
+        ax = self.plot_canvas.figure.add_subplot(211)
+        ax.plot([31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000], eq_curve, marker='o')
+        ax.set_xscale('log')
+        ax.set_title('EQ Curve')
+        ax.set_xlabel('Frequency (Hz)')
+        ax.set_ylabel('Gain (dB)')
+        ax.grid(True)
 
-    def update_gains(self):
-        self.eq_gains_db = [slider.value() / 10.0 for slider in self.sliders]
-        self.update_visuals()
+        ax2 = self.plot_canvas.figure.add_subplot(212)
+        ax2.bar([str(int(f)) for f in [31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]], song_profile)
+        ax2.set_title('Song Frequency Decomposition')
+        ax2.set_ylabel('dB Energy')
+        ax2.set_xlabel('Frequency (Hz)')
+        ax2.grid(True)
 
-    def load_audio(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open WAV file", "", "WAV files (*.wav)")
+        self.plot_canvas.draw()
+
+    def load_audio_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open WAV File", "", "WAV files (*.wav)")
         if file_path:
-            y, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
-            self.audio_data = y
-            self.update_visuals()
+            try:
+                with wave.open(file_path, 'rb') as wav:
+                    self.samplerate = wav.getframerate()
+                    n_frames = wav.getnframes()
+                    audio_data = np.frombuffer(wav.readframes(n_frames), dtype=np.int16)
+                    self.audio_data = audio_data.astype(np.float32) / 32768.0
 
-    def play_audio(self):
+                # Prompt for speaker profile
+                speaker_path, _ = QFileDialog.getOpenFileName(self, "Load Speaker Profile", "", "CSV files (*.csv)")
+                if speaker_path:
+                    speaker_profile = load_band_eq_from_csv(speaker_path)
+                    song_profile = compute_band_energy(self.audio_data, self.samplerate)
+                    eq_curve = generate_eq_curve(song_profile, speaker_profile)
+
+                    # Update sliders
+                    for i, val in enumerate(eq_curve):
+                        if i < len(self.eq_sliders):
+                            slider_val = int(round(val))
+                            self.eq_sliders[i].setValue(max(-10, min(10, slider_val)))
+            except Exception as e:
+                print("Error loading WAV file:", e)
+        self.show_eq_plot(eq_curve, song_profile)
+    def start_playback(self):
         if self.audio_data is None:
             return
-        self.playing = True
-        self.position = 0
-        with sd.OutputStream(callback=self.callback, samplerate=SAMPLE_RATE,
-                              channels=1, blocksize=BLOCK_SIZE):
-            while self.playing and self.position < len(self.audio_data):
-                sd.sleep(100)
 
-    def pause_audio(self):
-        self.playing = False
+        eq_gains_db = [slider.value() for slider in self.eq_sliders]
+        processed_audio = apply_eq(self.audio_data, eq_gains_db)
 
-    def callback(self, outdata, frames, time, status):
-        if not self.playing or self.position + frames >= len(self.audio_data):
-            outdata[:frames, 0] = 0
-            raise sd.CallbackStop()
+        if self.audio_thread:
+            self.audio_thread.stop()
+            self.audio_thread.wait()
 
-        chunk = self.audio_data[self.position:self.position+frames]
-        self.update_gains()
-        filters = self.create_band_filters()
-        eq_chunk = self.apply_eq(chunk, filters)
-        outdata[:, 0] = eq_chunk
-        self.position += frames
+        self.audio_thread = AudioPlaybackThread(processed_audio, self.samplerate)
+        self.audio_thread.start()
 
-    def create_band_filters(self):
-        filters = []
-        for gain_db, freq in zip(self.eq_gains_db, EQ_BANDS):
-            band = [freq / np.sqrt(2), freq * np.sqrt(2)]
-            sos = signal.iirfilter(2, [band[0]/(SAMPLE_RATE/2), band[1]/(SAMPLE_RATE/2)],
-                                   btype='band', ftype='butter', output='sos')
-            filters.append((sos, gain_db))
-        return filters
+    def pause_playback(self):
+        if self.audio_thread:
+            self.audio_thread.toggle_pause()
 
-    def apply_eq(self, data, filters):
-        eq_out = np.zeros_like(data)
-        for sos, gain_db in filters:
-            filtered = signal.sosfilt(sos, data)
-            gain = 10 ** (gain_db / 20)
-            eq_out += filtered * gain
-        return eq_out
-
-    def apply_auto_eq(self):
-        if self.audio_data is None:
-            return
-        self.auto_eq_curve = generate_eq_curve(self.audio_data, SAMPLE_RATE)
-        for i, gain in enumerate(self.auto_eq_curve):
-            self.sliders[i].setValue(int(gain * 10))
-        self.update_gains()
-
-    def update_visuals(self):
-        self.ax_eq.clear()
-        self.ax_spec.clear()
-
-        # Plot current EQ curve
-        self.ax_eq.semilogx(EQ_BANDS, self.eq_gains_db, marker='o', label='Manual EQ')
-        if self.auto_eq_curve is not None:
-            self.ax_eq.semilogx(EQ_BANDS, self.auto_eq_curve, marker='x', linestyle='--', color='red', label='Auto EQ')
-        self.ax_eq.set_title("EQ Curve")
-        self.ax_eq.set_xlabel("Frequency (Hz)")
-        self.ax_eq.set_ylabel("Gain (dB)")
-        self.ax_eq.legend()
-        self.ax_eq.grid(True, which='both', ls='--')
-
-        # Plot spectrogram of loaded audio
-        if self.audio_data is not None:
-            S = librosa.amplitude_to_db(np.abs(librosa.stft(self.audio_data)), ref=np.max)
-            self.ax_spec.imshow(S, aspect='auto', origin='lower', cmap='magma')
-            self.ax_spec.set_title("Spectrogram")
-            self.ax_spec.set_ylabel("Frequency bins")
-
-        self.figure.tight_layout()
-        self.canvas.draw()
+    def stop_playback(self):
+        if self.audio_thread:
+            self.audio_thread.stop()
+            self.audio_thread.wait()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    eq = Equalizer()
-    eq.show()
+    window = EqualizerApp()
+    window.show()
     sys.exit(app.exec_())
+
 
